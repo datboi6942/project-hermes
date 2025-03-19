@@ -9,4 +9,5 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4.3", features = ["derive"] }
 log = { workspace = true }
-env_logger = { workspace = true } 
+env_logger = { workspace = true }
+libp2p = { version = "0.52", features = ["tokio", "tcp"] } 

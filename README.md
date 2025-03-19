@@ -10,7 +10,7 @@ Project Hermes is a minimalistic, secure messaging application that prioritizes 
 
 - End-to-end encrypted messaging
 - Peer-to-peer communication (serverless)
-- IP address obfuscation
+- IP address obfuscation using onion routing
 - No-logs policy
 - Minimalistic UI
 - High-performance Rust backend
@@ -21,14 +21,19 @@ Project Hermes is a minimalistic, secure messaging application that prioritizes 
 hermes-core/           # Rust backend implementation
 ├── src/
 │   ├── crypto/       # Cryptographic operations
-│   ├── network/      # P2P networking and routing
 │   ├── protocol/     # Messaging protocol implementation
+│   ├── onion.rs      # Onion routing implementation
+│   ├── discovery.rs  # Node discovery service
 │   └── utils/        # Utility functions
-├── tests/            # Integration and unit tests
 └── Cargo.toml        # Rust dependencies and configuration
 
-hermes-android/       # Android client (TODO)
-hermes-desktop/       # Desktop client (TODO)
+hermes-cli/            # Command-line interface
+├── src/
+│   └── main.rs       # CLI implementation
+└── Cargo.toml        # CLI dependencies
+
+hermes-android/        # Android client (TODO)
+hermes-desktop/        # Desktop client (TODO)
 ```
 
 ## Building
@@ -36,28 +41,47 @@ hermes-desktop/       # Desktop client (TODO)
 ### Prerequisites
 
 - Rust (latest stable)
-- Android SDK (for Android development)
-- Flutter/Dart (for desktop client)
+- Android SDK (for future Android development)
+- Flutter/Dart (for future desktop client)
 
-### Building the Rust Backend
+### Building the Project
 
 ```bash
-cd hermes-core
+# Build both core and CLI components
 cargo build --release
+
+# Run the CLI
+cargo run --bin hermes-cli -- --help
+```
+
+### Running the Node
+
+```bash
+# Start a node
+cargo run --bin hermes-cli -- start --listen 127.0.0.1:9000
+```
+
+This will display your Peer ID, which other users will need to send messages to you:
+
+```
+Your Peer ID: 12D3KooWA8EXV2fkLsSXPzBt48wCaZ7tMWNiBkawChQBqKyqAkDL
+```
+
+# Send a message
+cargo run --bin hermes-cli -- send --peer <PEER_ID> --message "Hello, world!"
 ```
 
 ## Security Features
 
-- End-to-end encryption using modern cryptographic standards
+- End-to-end encryption using modern cryptographic standards (ed25519-dalek and x25519-dalek)
 - Secure key exchange protocols
-- Ephemeral messaging sessions
-- No persistent logging
-- IP address obfuscation through onion routing
+- Circuit-based onion routing for IP obfuscation
+- Node discovery mechanism for finding peers
 - Memory-safe implementation in Rust
 
 ## Development Status
 
-Currently in early development. Core Rust backend implementation is in progress.
+Currently in early development. Core Rust backend and CLI interface are functional with basic messaging capabilities.
 
 ## License
 
