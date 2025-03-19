@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 hermes-core = { path = "../hermes-core" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
 clap = { version = "4.3", features = ["derive"] }
 log = { workspace = true }
 env_logger = { workspace = true }
-libp2p = { version = "0.52", features = ["tokio", "tcp"] } 
+uuid = { version = "1.0", features = ["v4"] } 

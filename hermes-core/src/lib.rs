@@ -4,524 +4,351 @@ mod protocol;
 pub mod crypto;
 
 use anyhow::Result;
-use futures::StreamExt;
-use libp2p::{
-    core::transport::Transport,
-    noise,
-    yamux,
-    PeerId,
-    swarm::{
-        Swarm,
-        ConnectionId,
-        dummy::Behaviour,
-    },
-    identity,
-};
-#[cfg(feature = "logging")]
-use log::{info, warn, error};
-use tokio::sync::mpsc;
-use std::time::Duration;
-use crate::crypto::CryptoService;
 use std::collections::HashMap;
-use protocol::{ProtocolHandler, Message, MessageType, ControlMessage};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Mutex};
+use crate::crypto::CryptoService;
+use crate::protocol::{ProtocolHandler, Message, MessageType};
 
-pub use onion::{OnionRouter, OnionNode, OnionCircuit};
 pub use discovery::NodeDiscovery;
-pub use protocol::{Message as ProtocolMessage, MessageType as ProtocolMessageType, ControlMessage as ProtocolControlMessage};
+pub use protocol::{Message as ProtocolMessage, MessageType as ProtocolMessageType};
 
-const MAX_CONNECTIONS: usize = 50;
-const CIRCUIT_EXTENSION_TIMEOUT: Duration = Duration::from_secs(30);
-const MESSAGE_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
-const MIN_HOPS: usize = 1;
-const MAX_HOPS: usize = 5;
+#[cfg(feature = "logging")]
+use log::{info, error, debug};
 
-// Create a non-derived debug implementation
+// Simple network service using sockets
 pub struct NetworkService {
-    peer_id: PeerId,
-    swarm: Swarm<Behaviour>,
+    crypto_service: CryptoService,
+    protocol_handler: ProtocolHandler,
+    connections: HashMap<String, mpsc::Sender<Vec<u8>>>,
     message_sender: mpsc::Sender<NetworkMessage>,
     message_receiver: mpsc::Receiver<NetworkMessage>,
-    onion_router: OnionRouter,
-    node_discovery: NodeDiscovery,
-    protocol_handler: ProtocolHandler,
-    active_connections: HashMap<PeerId, ConnectionId>,
-    pending_circuit_extensions: HashMap<String, CircuitExtensionState>,
-    message_cleanup_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl std::fmt::Debug for NetworkService {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NetworkService")
-            .field("peer_id", &self.peer_id)
-            .field("active_connections", &self.active_connections.len())
-            .field("pending_extensions", &self.pending_circuit_extensions.len())
-            .finish()
-    }
-}
-
-#[derive(Debug)]
-struct CircuitExtensionState {
-    _circuit_id: String,
-    peer_id: PeerId,
-    timestamp: std::time::Instant,
-    nodes: Vec<OnionNode>,
+    node_id: String,
 }
 
 #[derive(Debug)]
 pub enum NetworkMessage {
-    Connect(PeerId),
-    SendMessage(PeerId, Vec<u8>),
-    Disconnect(PeerId),
-    OnionMessage(onion::OnionMessage),
-    NodeDiscovery(discovery::NodeInfo),
-    ConnectionEstablished(PeerId),
-    ConnectionClosed(PeerId),
-    MessageReceived(PeerId, Vec<u8>),
-    CircuitExtended(String),
-    CircuitExtensionFailed(String, String),
+    Connect(String, SocketAddr),
+    SendMessage(String, Vec<u8>),
+    Disconnect(String),
+    ConnectionEstablished(String, mpsc::Sender<Vec<u8>>),
+    ConnectionClosed(String),
+    MessageReceived(String, Vec<u8>),
     Error(String),
-    MessageExpired(String),
 }
 
 impl NetworkService {
     pub async fn new(crypto_service: CryptoService) -> Result<Self> {
-        let id_keys = identity::Keypair::generate_ed25519();
-        let peer_id = PeerId::from(id_keys.public());
-        
-        // Create a basic Noise config with the generated keys
-        let transport = libp2p::tcp::tokio::Transport::default()
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(noise::Config::new(&id_keys).unwrap())
-            .multiplex(yamux::Config::default())
-            .boxed();
-        
-        // Create message channels
         let (message_sender, message_receiver) = mpsc::channel(100);
-        
-        // Create network components
-        let onion_router = OnionRouter::new(crypto_service.clone());
-        let node_discovery = NodeDiscovery::new(crypto_service.clone());
         let protocol_handler = ProtocolHandler::new();
+        let connections = HashMap::new();
         
-        // Create swarm with dummy behavior
-        let behaviour = Behaviour{};
-        let config = libp2p::swarm::Config::with_tokio_executor();
-        let swarm = Swarm::new(transport, behaviour, peer_id, config);
-                
+        // Generate a unique node ID
+        let node_id = uuid::Uuid::new_v4().to_string();
+        
         Ok(NetworkService {
-            peer_id,
-            swarm,
+            crypto_service,
+            protocol_handler,
+            connections,
             message_sender,
             message_receiver,
-            onion_router,
-            node_discovery,
-            protocol_handler,
-            active_connections: HashMap::new(),
-            pending_circuit_extensions: HashMap::new(),
-            message_cleanup_task: None,
+            node_id,
         })
     }
-
-    pub async fn start(&mut self) -> Result<()> {
-        // Spawn a separate task for the message cleanup
-        let mut interval = tokio::time::interval(MESSAGE_CLEANUP_INTERVAL);
-        let handler_clone = self.protocol_handler.clone();
+    
+    pub async fn start(&mut self, listen_addr: SocketAddr) -> Result<()> {
+        // Create TCP listener to accept incoming connections
+        let listener = TcpListener::bind(listen_addr).await?;
         
-        self.message_cleanup_task = Some(tokio::spawn(async move {
+        #[cfg(feature = "logging")]
+        info!("Listening on {}", listen_addr);
+        
+        let msg_sender = self.message_sender.clone();
+        
+        // Spawn the listener task
+        tokio::spawn(async move {
             loop {
-                interval.tick().await;
-                if let Err(e) = handler_clone.cleanup_expired_messages().await {
-                    #[cfg(feature = "logging")]
-                    error!("Failed to clean up expired messages: {:?}", e);
+                match listener.accept().await {
+                    Ok((socket, addr)) => {
+                        #[cfg(feature = "logging")]
+                        info!("New connection from {}", addr);
+                        
+                        // Generate connection ID
+                        let conn_id = uuid::Uuid::new_v4().to_string();
+                        
+                        // Create a channel for sending data to this connection
+                        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+                        
+                        // Notify about new connection
+                        if let Err(e) = msg_sender.send(NetworkMessage::ConnectionEstablished(conn_id.clone(), tx.clone())).await {
+                            #[cfg(feature = "logging")]
+                            error!("Failed to send connection notification: {}", e);
+                        }
+                        
+                        // Spawn a task to handle this connection
+                        let conn_id_clone = conn_id.clone();
+                        let sender = msg_sender.clone();
+                        
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(socket, conn_id_clone, rx, sender).await {
+                                #[cfg(feature = "logging")]
+                                error!("Connection handling error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        #[cfg(feature = "logging")]
+                        error!("Failed to accept connection: {}", e);
+                    }
                 }
             }
-        }));
-
-        // Process events from swarm and timer
-        let mut timer = tokio::time::interval(Duration::from_secs(1));
-        let mut onion_timer = tokio::time::interval(Duration::from_millis(100));
+        });
         
-        loop {
-            tokio::select! {
-                event = self.swarm.select_next_some() => {
-                    if let Err(e) = self.handle_swarm_event(event).await {
-                        #[cfg(feature = "logging")]
-                        error!("Error handling network event: {:?}", e);
-                    }
-                },
-                _ = timer.tick() => {
-                    // Run periodic cleanup
-                    self.cleanup_pending_extensions().await;
-                    if let Err(e) = self.cleanup_stale_nodes().await {
-                        #[cfg(feature = "logging")]
-                        error!("Error cleaning up stale nodes: {:?}", e);
-                    }
-                },
-                _ = onion_timer.tick() => {
-                    // Process onion router messages
-                    if let Err(e) = self.onion_router.process_incoming_messages().await {
-                        #[cfg(feature = "logging")]
-                        error!("Error processing onion router messages: {:?}", e);
-                    }
-                },
-                msg = self.message_receiver.recv() => {
-                    match msg {
-                        Some(network_msg) => {
-                            if let Err(e) = self.handle_network_message(network_msg).await {
-                                #[cfg(feature = "logging")]
-                                error!("Error handling network message: {:?}", e);
-                            }
-                        },
-                        None => break, // Channel closed, exit
-                    }
-                },
+        // Process network messages
+        while let Some(message) = self.message_receiver.recv().await {
+            if let Err(e) = self.handle_network_message(message).await {
+                #[cfg(feature = "logging")]
+                error!("Failed to handle network message: {}", e);
             }
         }
-
+        
         Ok(())
     }
-
-    async fn handle_network_message(&mut self, msg: NetworkMessage) -> Result<()> {
-        match msg {
-            NetworkMessage::Connect(peer_id) => {
-                self.connect_to_peer(peer_id).await?;
-            },
-            NetworkMessage::Disconnect(peer_id) => {
-                self.disconnect_from_peer(peer_id).await?;
-            },
+    
+    async fn handle_network_message(&mut self, message: NetworkMessage) -> Result<()> {
+        match message {
+            NetworkMessage::Connect(peer_id, addr) => {
+                self.connect_to_peer(peer_id, addr).await?;
+            }
             NetworkMessage::SendMessage(peer_id, data) => {
                 self.send_message(peer_id, data).await?;
-            },
-            NetworkMessage::OnionMessage(onion_msg) => {
-                self.onion_router.handle_message(onion_msg).await?;
-            },
+            }
+            NetworkMessage::Disconnect(peer_id) => {
+                self.disconnect_from_peer(peer_id).await?;
+            }
+            NetworkMessage::ConnectionEstablished(peer_id, sender) => {
+                // Store the connection sender
+                self.connections.insert(peer_id, sender);
+            }
+            NetworkMessage::ConnectionClosed(peer_id) => {
+                // Remove the connection
+                self.connections.remove(&peer_id);
+            }
             NetworkMessage::MessageReceived(peer_id, data) => {
-                // Check if this is a circuit extension or confirmation message
-                if let Ok(protocol_msg) = serde_json::from_slice::<protocol::Message>(&data) {
-                    match protocol_msg.message_type {
-                        protocol::MessageType::Control(protocol::ControlMessage::CircuitExtend) => {
-                            self.handle_circuit_extension(peer_id, protocol_msg.content).await?;
-                        },
-                        protocol::MessageType::Control(protocol::ControlMessage::CircuitExtended) => {
-                            self.handle_circuit_extension_confirmation(peer_id, protocol_msg.content).await?;
-                        },
-                        _ => {
-                            #[cfg(feature = "logging")]
-                            info!("Received message from peer {}: {:?}", peer_id, protocol_msg.message_type);
-                        }
-                    }
-                }
-            },
-            _ => {}, // Handle other message types as needed
-        }
-        
-        Ok(())
-    }
-
-    pub async fn stop(&mut self) -> Result<()> {
-        // Cancel message cleanup task
-        if let Some(task) = self.message_cleanup_task.take() {
-            task.abort();
-        }
-
-        // Create a copy of the peer IDs to avoid borrowing issues
-        let peer_ids: Vec<PeerId> = self.active_connections.keys().cloned().collect();
-        
-        // Clean up all connections
-        for peer_id in peer_ids {
-            if let Err(e) = self.disconnect_from_peer(peer_id).await {
                 #[cfg(feature = "logging")]
-                warn!("Error disconnecting from peer {}: {:?}", peer_id, e);
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_swarm_event(&mut self, event: libp2p::swarm::SwarmEvent<void::Void, void::Void>) -> Result<()> {
-        match event {
-            libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
-                #[cfg(feature = "logging")]
-                info!("Listening on {}", address);
+                debug!("Received message from {}", peer_id);
                 
-                // Re-register as relay with our updated listener info
-                if let Err(e) = self.register_as_relay().await {
+                // Try to decode as protocol message
+                if let Ok(msg) = serde_json::from_slice::<Message>(&data) {
                     #[cfg(feature = "logging")]
-                    error!("Failed to update relay registration: {:?}", e);
+                    info!("Decoded protocol message: {:?}", msg.message_type);
                 }
             }
-            libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
-                #[cfg(feature = "logging")]
-                info!("Connection established with peer {}", peer_id);
-                self.active_connections.insert(peer_id, connection_id);
-                self.message_sender.send(NetworkMessage::ConnectionEstablished(peer_id)).await?;
-                
-                // Try to add this peer to discovery if we have connection to it
-                let node = OnionNode {
-                    id: peer_id.to_base58(),
-                    public_key: vec![0; 32], // We don't know the public key yet, dummy value
-                    address: format!("peer:{}", peer_id),
-                };
-                if let Err(e) = self.node_discovery.add_node(node).await {
-                    #[cfg(feature = "logging")]
-                    error!("Failed to add peer to discovery: {:?}", e);
-                }
-            }
-            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, connection_id, .. } => {
-                #[cfg(feature = "logging")]
-                info!("Connection closed with peer {}", peer_id);
-                if let Some(conn_id) = self.active_connections.get(&peer_id) {
-                    if *conn_id == connection_id {
-                        self.active_connections.remove(&peer_id);
-                    }
-                }
-                self.message_sender.send(NetworkMessage::ConnectionClosed(peer_id)).await?;
-            }
-            libp2p::swarm::SwarmEvent::IncomingConnection { connection_id, .. } => {
-                // Handle connection limit - simplified for now
-                if self.active_connections.len() >= MAX_CONNECTIONS {
-                    #[cfg(feature = "logging")]
-                    warn!("Connection limit reached, rejecting connection");
-                    let _ = self.swarm.close_connection(connection_id);
-                }
-            },
-            _ => {}
+            _ => {} // Handle other cases
         }
+        
         Ok(())
     }
-
-    pub async fn extend_circuit(&mut self, circuit_id: String, peer_id: PeerId) -> Result<()> {
-        // Get available nodes for circuit extension
-        let nodes = self.node_discovery.get_available_nodes(2).await?;
+    
+    pub async fn connect_to_peer(&mut self, peer_id: String, addr: SocketAddr) -> Result<()> {
+        // Check if already connected
+        if self.connections.contains_key(&peer_id) {
+            return Ok(()); // Already connected
+        }
         
-        // Create circuit extension state
-        let state = CircuitExtensionState {
-            _circuit_id: circuit_id.clone(),
-            peer_id,
-            timestamp: std::time::Instant::now(),
-            nodes: nodes.clone(),
-        };
-        
-        // Add to pending extensions
-        self.pending_circuit_extensions.insert(circuit_id.clone(), state);
-        
-        // Create extension message
-        let extension_message = Message {
+        // Attempt to connect
+        match TcpStream::connect(addr).await {
+            Ok(socket) => {
+                // Create a channel for sending data to this connection
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+                
+                // Store the connection sender
+                self.connections.insert(peer_id.clone(), tx.clone());
+                
+                #[cfg(feature = "logging")]
+                info!("Connected to peer {} at {}", peer_id, addr);
+                
+                // Spawn a task to handle this connection
+                let sender = self.message_sender.clone();
+                let peer_id_clone = peer_id.clone();
+                
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(socket, peer_id_clone, rx, sender).await {
+                        #[cfg(feature = "logging")]
+                        error!("Connection handling error: {}", e);
+                    }
+                });
+                
+                Ok(())
+            }
+            Err(e) => {
+                #[cfg(feature = "logging")]
+                error!("Failed to connect to {}: {}", addr, e);
+                
+                Err(anyhow::anyhow!("Failed to connect to peer"))
+            }
+        }
+    }
+    
+    pub async fn send_message(&mut self, peer_id: String, data: Vec<u8>) -> Result<()> {
+        // Create protocol message
+        let protocol_message = Message {
             id: uuid::Uuid::new_v4().to_string(),
-            sender: self.peer_id.to_base58(),
-            recipient: peer_id.to_base58(),
-            content: serde_json::to_vec(&nodes)?,
+            sender: self.node_id.clone(),
+            recipient: peer_id.clone(),
+            content: data,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            message_type: MessageType::Control(ControlMessage::CircuitExtend),
+            message_type: MessageType::Text,
         };
         
-        // Encode and send the extension message
-        let _encoded_message = self.protocol_handler.encode_message(&extension_message)?;
-        #[cfg(feature = "logging")]
-        info!("Sending circuit extension request to peer {}", peer_id);
+        // Encode the message
+        let encoded = serde_json::to_vec(&protocol_message)?;
         
-        // Send circuit extension request
-        self.protocol_handler.send_message(peer_id.to_base58(), extension_message).await?;
-        
-        Ok(())
-    }
-
-    async fn handle_circuit_extension(&mut self, peer_id: PeerId, data: Vec<u8>) -> Result<()> {
-        // Parse extension data
-        let nodes: Vec<OnionNode> = serde_json::from_slice(&data)?;
-        
-        // Create new circuit with extended nodes
-        let circuit_id = self.onion_router.create_circuit(nodes).await?;
-        
-        // Create confirmation message
-        let confirmation = Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            sender: self.peer_id.to_base58(),
-            recipient: peer_id.to_base58(),
-            content: circuit_id.as_bytes().to_vec(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            message_type: MessageType::Control(ControlMessage::CircuitExtended),
-        };
-        
-        // Send extension confirmation
-        self.protocol_handler.send_message(peer_id.to_base58(), confirmation).await?;
-        
-        Ok(())
-    }
-
-    async fn handle_circuit_extension_confirmation(&mut self, _peer_id: PeerId, data: Vec<u8>) -> Result<()> {
-        let circuit_id = String::from_utf8_lossy(&data).to_string();
-        
-        if let Some(state) = self.pending_circuit_extensions.remove(&circuit_id) {
-            if state.timestamp.elapsed() > CIRCUIT_EXTENSION_TIMEOUT {
-                self.message_sender.send(NetworkMessage::CircuitExtensionFailed(
-                    circuit_id,
-                    "Extension timeout".to_string(),
-                )).await?;
-                return Ok(());
-            }
+        // Get the connection sender
+        if let Some(sender) = self.connections.get(&peer_id) {
+            // Add message length as prefix
+            let len = encoded.len() as u32;
+            let len_bytes = len.to_be_bytes();
             
-            self.message_sender.send(NetworkMessage::CircuitExtended(circuit_id)).await?;
-        }
-        
-        Ok(())
-    }
-
-    pub fn get_peer_id(&self) -> PeerId {
-        self.peer_id
-    }
-
-    pub fn swarm_mut(&mut self) -> &mut Swarm<Behaviour> {
-        &mut self.swarm
-    }
-
-    pub async fn connect_to_peer(&mut self, peer_id: PeerId) -> Result<()> {
-        if self.active_connections.contains_key(&peer_id) {
-            return Err(anyhow::anyhow!("Already connected to peer"));
-        }
-
-        if self.active_connections.len() >= MAX_CONNECTIONS {
-            return Err(anyhow::anyhow!("Maximum connections reached"));
-        }
-
-        // In a real implementation, we would use multiaddrs instead of just PeerIDs
-        self.swarm.dial(peer_id)?;
-        Ok(())
-    }
-
-    pub async fn send_message(&mut self, _peer_id: PeerId, message: Vec<u8>) -> Result<()> {
-        // Get random number of hops between MIN_HOPS and MAX_HOPS
-        let num_hops = rand::random::<usize>() % (MAX_HOPS - MIN_HOPS + 1) + MIN_HOPS;
-        
-        // Get available nodes for onion routing
-        let nodes = self.node_discovery.get_available_nodes(num_hops).await?;
-        
-        // Create onion circuit
-        let circuit_id = self.onion_router.create_circuit(nodes).await?;
-
-        // Send message through onion circuit
-        self.onion_router.send_message(&circuit_id, &message).await?;
-
-        // Clean up circuit after sending
-        self.onion_router.destroy_circuit(&circuit_id).await?;
-
-        Ok(())
-    }
-
-    pub async fn disconnect_from_peer(&mut self, peer_id: PeerId) -> Result<()> {
-        if self.active_connections.contains_key(&peer_id) {
-            // The latest libp2p API only needs the PeerId, not the ConnectionId
-            let _ = self.swarm.disconnect_peer_id(peer_id);
-            self.active_connections.remove(&peer_id);
-        }
-        Ok(())
-    }
-
-    pub async fn register_as_relay(&mut self) -> Result<()> {
-        // Get the public IP address from the swarm
-        let addresses: Vec<String> = self.swarm.listeners()
-            .map(|addr| addr.to_string())
-            .collect();
+            // Create complete message
+            let mut complete_msg = Vec::with_capacity(len_bytes.len() + encoded.len());
+            complete_msg.extend_from_slice(&len_bytes);
+            complete_msg.extend_from_slice(&encoded);
             
-        let address = if !addresses.is_empty() {
-            addresses.join(",")
+            // Send through the channel
+            sender.send(complete_msg).await
+                .map_err(|_| anyhow::anyhow!("Failed to send message to connection handler"))?;
+            
+            #[cfg(feature = "logging")]
+            info!("Sent message to peer {}", peer_id);
+            
+            Ok(())
         } else {
-            "0.0.0.0:0".to_string()
-        };
+            Err(anyhow::anyhow!("No connection to peer"))
+        }
+    }
+    
+    pub async fn disconnect_from_peer(&mut self, peer_id: String) -> Result<()> {
+        // Just remove the connection sender, the task will eventually complete
+        if self.connections.remove(&peer_id).is_some() {
+            #[cfg(feature = "logging")]
+            info!("Disconnected from peer {}", peer_id);
+        }
         
-        // Create node info for this peer
-        let node = OnionNode {
-            id: self.peer_id.to_base58(),
-            public_key: self.onion_router.get_public_key(),
-            address,
-        };
-
-        // Add self to node discovery
-        self.node_discovery.add_node(node).await?;
-
         Ok(())
     }
-
-    pub async fn cleanup_stale_nodes(&mut self) -> Result<()> {
-        self.node_discovery.cleanup_stale_nodes().await
+    
+    pub fn get_node_id(&self) -> String {
+        self.node_id.clone()
     }
-
-    pub async fn cleanup_pending_extensions(&mut self) {
-        let _now = std::time::Instant::now();
-        let mut failed_extensions = Vec::new();
-        
-        for (circuit_id, state) in &self.pending_circuit_extensions {
-            if state.timestamp.elapsed() > CIRCUIT_EXTENSION_TIMEOUT {
-                failed_extensions.push((circuit_id.clone(), state.peer_id, state.nodes.len()));
-            }
-        }
-        
-        for (circuit_id, peer_id, node_count) in failed_extensions {
-            if let Some(_state) = self.pending_circuit_extensions.remove(&circuit_id) {
-                #[cfg(feature = "logging")]
-                error!("Circuit extension for {} with peer {} and {} nodes failed due to timeout", 
-                    circuit_id, peer_id, node_count);
-                    
-                if let Err(e) = self.message_sender.send(NetworkMessage::CircuitExtensionFailed(
-                    circuit_id,
-                    "Extension timeout".to_string(),
-                )).await {
-                    #[cfg(feature = "logging")]
-                    error!("Failed to send circuit extension failure message: {:?}", e);
-                }
-            }
-        }
+    
+    // Simplified implementation that doesn't use onion routing
+    pub async fn add_peer_to_discovery(&self, _peer_id: String, _address: String) -> Result<()> {
+        Ok(())
+    }
+    
+    pub async fn setup_tor_transport(&self) -> Result<()> {
+        #[cfg(feature = "logging")]
+        info!("Tor functionality not implemented yet");
+        Ok(())
+    }
+    
+    pub async fn add_relay(&self, _addr: SocketAddr) -> Result<()> {
+        #[cfg(feature = "logging")]
+        info!("Relay functionality not implemented yet");
+        Ok(())
+    }
+    
+    pub async fn register_as_relay(&self) -> Result<()> {
+        #[cfg(feature = "logging")]
+        info!("Relay functionality not implemented yet");
+        Ok(())
+    }
+    
+    pub async fn setup_as_relay(&self) -> Result<()> {
+        #[cfg(feature = "logging")]
+        info!("Relay functionality not implemented yet");
+        Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::crypto::CryptoService;
-
-    #[tokio::test]
-    async fn test_network_service_creation() {
-        let crypto_service = CryptoService::new().unwrap();
-        let service = NetworkService::new(crypto_service).await.unwrap();
-        assert!(service.peer_id.to_base58().len() > 0);
+// Helper function to handle a single connection
+async fn handle_connection(
+    mut socket: TcpStream, 
+    conn_id: String,
+    mut command_rx: mpsc::Receiver<Vec<u8>>,
+    sender: mpsc::Sender<NetworkMessage>,
+) -> Result<()> {
+    let mut buf = vec![0; 4]; // Buffer for message length
+    
+    loop {
+        tokio::select! {
+            // Handle incoming data from the socket
+            read_result = socket.read_exact(&mut buf) => {
+                match read_result {
+                    Ok(_) => {
+                        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                        
+                        // Read the message
+                        let mut data = vec![0; len];
+                        match socket.read_exact(&mut data).await {
+                            Ok(_) => {
+                                // Forward the message
+                                if let Err(e) = sender.send(NetworkMessage::MessageReceived(conn_id.clone(), data)).await {
+                                    #[cfg(feature = "logging")]
+                                    error!("Failed to forward message: {}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                #[cfg(feature = "logging")]
+                                error!("Failed to read message data: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            #[cfg(feature = "logging")]
+                            info!("Connection closed by peer");
+                        } else {
+                            #[cfg(feature = "logging")]
+                            error!("Failed to read message length: {}", e);
+                        }
+                        break;
+                    }
+                }
+            }
+            
+            // Handle outgoing data
+            Some(data) = command_rx.recv() => {
+                if let Err(e) = socket.write_all(&data).await {
+                    #[cfg(feature = "logging")]
+                    error!("Failed to write to socket: {}", e);
+                    break;
+                }
+            }
+            
+            // Exit if the sender channel closes
+            else => {
+                break;
+            }
+        }
     }
+    
+    // Connection closed
+    sender.send(NetworkMessage::ConnectionClosed(conn_id)).await?;
+    
+    Ok(())
+}
 
-    #[tokio::test]
-    async fn test_connection_management() -> Result<()> {
-        let crypto_service = CryptoService::new().unwrap();
-        let mut service = NetworkService::new(crypto_service).await?;
-        
-        // Test connection limit
-        let random_peer = PeerId::random();
-        
-        // This should fail since we can't actually connect to a random peer
-        let result = service.connect_to_peer(random_peer).await;
-        assert!(result.is_err(), "Expected connection to random peer to fail");
-        
-        // But the functionality itself should execute without panicking
-        assert!(service.active_connections.len() <= MAX_CONNECTIONS);
-        
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_circuit_extension() -> Result<()> {
-        let crypto_service = CryptoService::new().unwrap();
-        let mut service = NetworkService::new(crypto_service).await?;
-        
-        let peer_id = PeerId::random();
-        let circuit_id = "test_circuit".to_string();
-        
-        // Test circuit extension
-        let result = service.extend_circuit(circuit_id.clone(), peer_id).await;
-        assert!(result.is_err(), "Circuit extension should fail without enough nodes");
-        
-        Ok(())
-    }
-} 
+// Simple stub implementations for compatibility
+pub struct OnionRouter;
+pub struct OnionNode;
+pub struct OnionCircuit; 

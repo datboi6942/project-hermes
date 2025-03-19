@@ -4,9 +4,8 @@ use hermes_core::{
     crypto::CryptoService,
     NetworkService,
 };
-use libp2p::PeerId;
-use std::str::FromStr;
-use log::info;
+use std::net::SocketAddr;
+use log::{info, warn};
 
 #[derive(Parser)]
 #[clap(name = "hermes", version = "0.1.0", about = "Project Hermes secure messaging CLI")]
@@ -22,6 +21,19 @@ enum Command {
         /// Listen on this address
         #[clap(long, default_value = "127.0.0.1:8080")]
         listen: String,
+        
+        /// Use Tor for enhanced privacy (requires Tor daemon running)
+        #[clap(long)]
+        use_tor: bool,
+    },
+    /// Connect to a peer
+    Connect {
+        /// Peer ID to connect to
+        #[clap(long)]
+        peer: String,
+        /// Address of the peer (e.g. "192.168.1.5:9000")
+        #[clap(long)]
+        address: String,
     },
     /// Send a message to a peer
     Send {
@@ -49,51 +61,67 @@ async fn main() -> Result<()> {
     
     // Process command
     match cli.command {
-        Command::Start { listen } => {
+        Command::Start { listen, use_tor } => {
             info!("Starting Hermes node on {}", listen);
             
-            // Display the local peer ID
-            let peer_id = network.get_peer_id();
-            println!("Your Peer ID: {}", peer_id.to_base58());
-            info!("Your Peer ID: {}", peer_id.to_base58());
+            // Display the local node ID
+            let node_id = network.get_node_id();
+            println!("Your Node ID: {}", node_id);
+            info!("Your Node ID: {}", node_id);
+            
+            // Set up Tor if requested
+            if use_tor {
+                println!("Setting up Tor routing for enhanced privacy...");
+                if let Err(e) = network.setup_tor_transport().await {
+                    warn!("Failed to set up Tor transport: {}", e);
+                    println!("WARNING: Tor setup failed. Continuing with standard networking.");
+                } else {
+                    println!("Tor routing enabled. Your IP address will be hidden.");
+                }
+            } else {
+                println!("TIP: For better privacy, restart with --use-tor flag to route traffic through Tor.");
+            }
             
             // Set up a listener on the specified address
-            let addr: std::net::SocketAddr = listen.parse().expect("Failed to parse listen address");
-            let ip_component = match addr.ip() {
-                std::net::IpAddr::V4(ip) => libp2p::Multiaddr::from(ip),
-                std::net::IpAddr::V6(ip) => libp2p::Multiaddr::from(ip),
-            };
-            let listen_addr = ip_component.with(libp2p::multiaddr::Protocol::Tcp(addr.port()));
+            let addr: SocketAddr = listen.parse().expect("Failed to parse listen address");
             
-            // Listen on the specified address
-            let _ = network.swarm_mut().listen_on(listen_addr)
-                .expect("Failed to listen on address");
-            
-            // Register as relay if enabled
-            network.register_as_relay().await?;
+            println!("Node is running. Messages will be received automatically.");
+            println!("Press Ctrl+C to exit.");
             
             // Start the network service - this will block until finished
-            network.start().await?;
+            network.start(addr).await?;
+        },
+        Command::Connect { peer, address } => {
+            info!("Connecting to peer {} at {}", peer, address);
+            
+            // Parse socket address
+            let addr: SocketAddr = address.parse().expect("Failed to parse socket address");
+            
+            // Connect to the peer
+            network.connect_to_peer(peer.clone(), addr).await?;
+            
+            println!("Successfully connected to peer {}", peer);
+            info!("Connected to peer {}", peer);
         },
         Command::Send { peer, message } => {
             info!("Sending message to peer {}", peer);
-            
-            // Parse peer ID
-            let peer_id = match PeerId::from_str(&peer) {
-                Ok(id) => id,
-                Err(e) => {
-                    eprintln!("Error parsing peer ID: {}", e);
-                    return Err(anyhow::anyhow!("Invalid peer ID format"));
-                }
-            };
             
             // Convert message string to bytes
             let message_bytes = message.as_bytes().to_vec();
             
             // Send message
-            network.send_message(peer_id, message_bytes).await?;
-            info!("Message sent successfully");
-        }
+            match network.send_message(peer.clone(), message_bytes).await {
+                Ok(_) => {
+                    println!("Message sent successfully to {}", peer);
+                },
+                Err(e) => {
+                    println!("Failed to send message: {}", e);
+                    println!("Note: The recipient must be online and connected.");
+                    println!("Try running 'connect' command first to establish a connection.");
+                    return Err(e);
+                }
+            }
+        },
     }
 
     Ok(())

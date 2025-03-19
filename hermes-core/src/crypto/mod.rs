@@ -34,7 +34,12 @@ impl KeyPair {
         let mut csprng = OsRng;
         
         // Generate Ed25519 keypair for signatures
-        let ed25519_secret = Ed25519SecretKey::generate(&mut csprng);
+        // Generate random bytes for the secret key
+        let mut secret_bytes = [0u8; 32];
+        csprng.fill_bytes(&mut secret_bytes);
+        
+        // Create signing key from bytes
+        let ed25519_secret = Ed25519SecretKey::from_bytes(&secret_bytes);
         let ed25519_public = ed25519_secret.verifying_key();
         
         // Generate X25519 keypair for key exchange (if needed)
