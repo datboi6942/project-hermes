@@ -25,6 +25,12 @@ const MAX_SPEED_THRESHOLD: f64 = 1.5; // 150% of target speed
 const QUEUE_CHECK_INTERVAL_MS: u64 = 1000;
 const ERROR_RECOVERY_DELAY_MS: u64 = 1000;
 const MAX_ERROR_RETRIES: u32 = 3;
+const NETWORK_CHECK_INTERVAL_MS: u64 = 5000;
+const MIN_NETWORK_SPEED_BYTES_PER_SEC: u64 = 1024; // 1KB/s
+const MAX_NETWORK_SPEED_BYTES_PER_SEC: u64 = 1024 * 1024 * 10; // 10MB/s
+const QUEUE_PRIORITY_LEVELS: u8 = 5;
+const ERROR_RECOVERY_BACKOFF_MS: u64 = 1000;
+const MAX_ERROR_RECOVERY_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ProtocolMessage {
@@ -154,6 +160,55 @@ pub enum ProtocolMessage {
         expiry: u64,
         ephemeral_id: String,
     },
+    NetworkStatus {
+        available_bandwidth: u64,
+        latency_ms: u64,
+        packet_loss: f64,
+        timestamp: u64,
+        expiry: u64,
+        ephemeral_id: String,
+    },
+    TransferResumeRequest {
+        file_id: String,
+        resume_point: u64,
+        network_status: NetworkStatus,
+        timestamp: u64,
+        expiry: u64,
+        ephemeral_id: String,
+    },
+    TransferResumeResponse {
+        file_id: String,
+        accepted: bool,
+        reason: Option<String>,
+        timestamp: u64,
+        expiry: u64,
+        ephemeral_id: String,
+    },
+    TransferQueueStatus {
+        file_id: String,
+        position: u32,
+        priority: u8,
+        estimated_wait_time: u64,
+        timestamp: u64,
+        expiry: u64,
+        ephemeral_id: String,
+    },
+    ErrorRecoveryRequest {
+        file_id: String,
+        error_type: String,
+        error_details: String,
+        timestamp: u64,
+        expiry: u64,
+        ephemeral_id: String,
+    },
+    ErrorRecoveryResponse {
+        file_id: String,
+        recovery_action: String,
+        retry_delay: u64,
+        timestamp: u64,
+        expiry: u64,
+        ephemeral_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,6 +254,7 @@ pub struct ProtocolHandler {
     bandwidth_manager: BandwidthManager,
     transfer_priorities: BinaryHeap<FileTransferPriority>,
     transfer_queue: TransferQueue,
+    network_monitor: NetworkMonitor,
 }
 
 #[derive(Debug)]
@@ -373,6 +429,8 @@ impl RateLimiter {
 struct TransferQueue {
     queue: VecDeque<String>,
     last_check: u64,
+    priorities: HashMap<String, u8>,
+    wait_times: HashMap<String, u64>,
 }
 
 impl TransferQueue {
@@ -383,6 +441,8 @@ impl TransferQueue {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
+            priorities: HashMap::new(),
+            wait_times: HashMap::new(),
         }
     }
 
@@ -403,6 +463,28 @@ impl TransferQueue {
     fn next_transfer(&mut self) -> Option<String> {
         self.queue.pop_front()
     }
+
+    fn update_priority(&mut self, file_id: &str, priority: u8) {
+        self.priorities.insert(file_id.to_string(), priority);
+    }
+
+    fn get_priority(&self, file_id: &str) -> u8 {
+        self.priorities.get(file_id).copied().unwrap_or(0)
+    }
+
+    fn update_wait_time(&mut self, file_id: &str, wait_time: u64) {
+        self.wait_times.insert(file_id.to_string(), wait_time);
+    }
+
+    fn get_wait_time(&self, file_id: &str) -> u64 {
+        self.wait_times.get(file_id).copied().unwrap_or(0)
+    }
+
+    fn calculate_estimated_wait_time(&self, file_id: &str) -> u64 {
+        let position = self.get_position(file_id).unwrap_or(0) as u64;
+        let avg_transfer_time = 5000; // 5 seconds average transfer time
+        position * avg_transfer_time
+    }
 }
 
 impl ProtocolHandler {
@@ -422,6 +504,7 @@ impl ProtocolHandler {
             bandwidth_manager: BandwidthManager::new(MAX_BANDWIDTH_BYTES_PER_SEC),
             transfer_priorities: BinaryHeap::new(),
             transfer_queue: TransferQueue::new(),
+            network_monitor: NetworkMonitor::new(),
         }
     }
 
@@ -743,6 +826,79 @@ impl ProtocolHandler {
                         self.message_sender.send(retry_msg).await?;
                     }
                 }
+            }
+            ProtocolMessage::NetworkStatus { available_bandwidth, latency_ms, packet_loss, timestamp, expiry, ephemeral_id } => {
+                if self.is_message_expired(*timestamp, *expiry) {
+                    return Ok(());
+                }
+
+                let status = NetworkStatus {
+                    available_bandwidth: *available_bandwidth,
+                    latency_ms: *latency_ms,
+                    packet_loss: *packet_loss,
+                };
+                self.network_monitor.update_status(status);
+                
+                // Adapt transfer speeds based on network conditions
+                self.adapt_transfer_speeds().await?;
+            }
+            ProtocolMessage::TransferResumeRequest { file_id, resume_point, network_status, timestamp, expiry, ephemeral_id } => {
+                if self.is_message_expired(*timestamp, *expiry) {
+                    return Ok(());
+                }
+
+                let can_resume = self.can_resume_transfer(file_id, resume_point, network_status);
+                let response = ProtocolMessage::TransferResumeResponse {
+                    file_id: file_id.clone(),
+                    accepted: can_resume,
+                    reason: if !can_resume { Some("Network conditions not suitable".to_string()) } else { None },
+                    timestamp: *timestamp,
+                    expiry: *expiry,
+                    ephemeral_id: self.generate_ephemeral_id(),
+                };
+                self.send_message(peer_id, response).await?;
+            }
+            ProtocolMessage::TransferResumeResponse { file_id, accepted, reason, timestamp, expiry, ephemeral_id } => {
+                if self.is_message_expired(*timestamp, *expiry) {
+                    return Ok(());
+                }
+
+                if *accepted {
+                    self.resume_transfer(file_id).await?;
+                } else {
+                    log::warn!("Transfer resume rejected for file {}: {:?}", file_id, reason);
+                }
+            }
+            ProtocolMessage::TransferQueueStatus { file_id, position, priority, estimated_wait_time, timestamp, expiry, ephemeral_id } => {
+                if self.is_message_expired(*timestamp, *expiry) {
+                    return Ok(());
+                }
+
+                self.transfer_queue.update_priority(file_id, *priority);
+                self.transfer_queue.update_wait_time(file_id, *estimated_wait_time);
+            }
+            ProtocolMessage::ErrorRecoveryRequest { file_id, error_type, error_details, timestamp, expiry, ephemeral_id } => {
+                if self.is_message_expired(*timestamp, *expiry) {
+                    return Ok(());
+                }
+
+                let (recovery_action, retry_delay) = self.determine_recovery_action(file_id, error_type, error_details);
+                let response = ProtocolMessage::ErrorRecoveryResponse {
+                    file_id: file_id.clone(),
+                    recovery_action,
+                    retry_delay,
+                    timestamp: *timestamp,
+                    expiry: *expiry,
+                    ephemeral_id: self.generate_ephemeral_id(),
+                };
+                self.send_message(peer_id, response).await?;
+            }
+            ProtocolMessage::ErrorRecoveryResponse { file_id, recovery_action, retry_delay, timestamp, expiry, ephemeral_id } => {
+                if self.is_message_expired(*timestamp, *expiry) {
+                    return Ok(());
+                }
+
+                self.execute_recovery_action(file_id, recovery_action, *retry_delay).await?;
             }
         }
 
@@ -1216,25 +1372,162 @@ impl ProtocolHandler {
             .as_millis() as u64;
 
         if now - self.transfer_queue.last_check >= QUEUE_CHECK_INTERVAL_MS {
+            // Update queue status for all transfers
+            for (file_id, _) in &self.file_transfers {
+                let position = self.transfer_queue.get_position(file_id);
+                let priority = self.transfer_queue.get_priority(file_id);
+                let wait_time = self.transfer_queue.calculate_estimated_wait_time(file_id);
+
+                let status = ProtocolMessage::TransferQueueStatus {
+                    file_id: file_id.clone(),
+                    position: position.unwrap_or(0),
+                    priority,
+                    estimated_wait_time: wait_time,
+                    timestamp: now,
+                    expiry: MESSAGE_EXPIRY_SECONDS,
+                    ephemeral_id: self.generate_ephemeral_id(),
+                };
+                self.message_sender.send(status).await?;
+            }
+
+            // Process next transfer based on priority
             if let Some(file_id) = self.transfer_queue.next_transfer() {
                 if let Some(transfer) = self.file_transfers.get(&file_id) {
-                    // Update queue position for all transfers
-                    for (id, pos) in self.transfer_queue.queue.iter().enumerate() {
-                        let notification = ProtocolMessage::FileTransferQueueUpdate {
-                            file_id: pos.clone(),
-                            queue_position: id as u32,
-                            timestamp: now,
-                            expiry: MESSAGE_EXPIRY_SECONDS,
-                            ephemeral_id: self.generate_ephemeral_id(),
-                        };
-                        self.message_sender.send(notification).await?;
-                    }
-
-                    // Process the next transfer
                     self.process_pending_chunks(file_id.clone(), "peer".to_string()).await?;
                 }
             }
+
             self.transfer_queue.last_check = now;
+        }
+        Ok(())
+    }
+
+    async fn adapt_transfer_speeds(&mut self) -> Result<()> {
+        let avg_bandwidth = self.network_monitor.get_average_bandwidth();
+        let avg_latency = self.network_monitor.get_average_latency();
+        let avg_packet_loss = self.network_monitor.get_average_packet_loss();
+
+        // Calculate optimal chunk size based on network conditions
+        let optimal_chunk_size = if avg_latency > 100 {
+            CHUNK_SIZE / 2 // Reduce chunk size for high latency
+        } else if avg_packet_loss > 0.1 {
+            CHUNK_SIZE / 4 // Further reduce for high packet loss
+        } else {
+            CHUNK_SIZE
+        };
+
+        // Adjust transfer speeds based on network conditions
+        for (file_id, transfer) in self.file_transfers.iter_mut() {
+            let target_speed = if avg_packet_loss > 0.2 {
+                transfer.target_speed * 0.5 // Reduce speed for high packet loss
+            } else if avg_latency > 200 {
+                transfer.target_speed * 0.75 // Reduce speed for high latency
+            } else {
+                transfer.target_speed
+            };
+
+            let bandwidth_limit = (target_speed * optimal_chunk_size as f64) as u64;
+            transfer.bandwidth_limit = bandwidth_limit.min(avg_bandwidth);
+            self.bandwidth_manager.allocate_bandwidth(file_id, transfer.bandwidth_limit);
+        }
+
+        Ok(())
+    }
+
+    fn can_resume_transfer(&self, file_id: &str, resume_point: &u64, network_status: &NetworkStatus) -> bool {
+        // Check if network conditions are suitable for resuming
+        if network_status.available_bandwidth < MIN_NETWORK_SPEED_BYTES_PER_SEC {
+            return false;
+        }
+
+        if network_status.latency_ms > 1000 {
+            return false;
+        }
+
+        if network_status.packet_loss > 0.2 {
+            return false;
+        }
+
+        // Check if we have the necessary data to resume
+        if let Some(transfer) = self.file_transfers.get(file_id) {
+            transfer.bytes_transferred >= *resume_point
+        } else {
+            false
+        }
+    }
+
+    async fn resume_transfer(&mut self, file_id: &str) -> Result<()> {
+        if let Some(transfer) = self.file_transfers.get_mut(file_id) {
+            transfer.error_count = 0;
+            transfer.last_error = None;
+            transfer.is_cancelled = false;
+            
+            // Request missing chunks
+            let missing_chunks: Vec<u32> = (transfer.resume_point..transfer.total_chunks)
+                .filter(|&i| !transfer.received_chunks.contains(&i))
+                .collect();
+
+            if !missing_chunks.is_empty() {
+                let request = ProtocolMessage::FileChunkRequest {
+                    file_id: file_id.to_string(),
+                    chunk_indices: missing_chunks,
+                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    expiry: MESSAGE_EXPIRY_SECONDS,
+                    ephemeral_id: self.generate_ephemeral_id(),
+                };
+                self.message_sender.send(request).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn determine_recovery_action(&self, file_id: &str, error_type: &str, error_details: &str) -> (String, u64) {
+        let mut retry_delay = ERROR_RECOVERY_BACKOFF_MS;
+        
+        let action = match error_type {
+            "network_error" => {
+                retry_delay *= 2;
+                "retry_with_reduced_speed"
+            }
+            "timeout" => {
+                retry_delay *= 3;
+                "retry_with_increased_timeout"
+            }
+            "corruption" => {
+                retry_delay *= 4;
+                "retry_with_verification"
+            }
+            _ => "retry"
+        };
+
+        (action.to_string(), retry_delay)
+    }
+
+    async fn execute_recovery_action(&mut self, file_id: &str, action: &str, retry_delay: u64) -> Result<()> {
+        if let Some(transfer) = self.file_transfers.get_mut(file_id) {
+            match action {
+                "retry_with_reduced_speed" => {
+                    transfer.target_speed *= 0.5;
+                    transfer.bandwidth_limit = (transfer.target_speed * CHUNK_SIZE as f64) as u64;
+                }
+                "retry_with_increased_timeout" => {
+                    // Implement timeout adjustment
+                }
+                "retry_with_verification" => {
+                    // Implement additional verification
+                }
+                _ => {}
+            }
+
+            // Schedule retry after delay
+            let retry_msg = ProtocolMessage::FileTransferResume {
+                file_id: file_id.to_string(),
+                resume_point: transfer.bytes_transferred,
+                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + retry_delay / 1000,
+                expiry: MESSAGE_EXPIRY_SECONDS,
+                ephemeral_id: self.generate_ephemeral_id(),
+            };
+            self.message_sender.send(retry_msg).await?;
         }
         Ok(())
     }
@@ -1741,7 +2034,7 @@ mod tests {
         // Report error
         let error_msg = ProtocolMessage::FileTransferError {
             file_id: file_id.clone(),
-            error_type: "Network error".to_string(),
+            error_type: "network_error".to_string(),
             retry_count: 1,
             timestamp,
             expiry: MESSAGE_EXPIRY_SECONDS,
@@ -1751,6 +2044,102 @@ mod tests {
 
         let transfer = handler.file_transfers.get(&file_id).unwrap();
         assert_eq!(transfer.error_count, 1);
-        assert_eq!(transfer.last_error, Some("Network error".to_string()));
+        assert_eq!(transfer.last_error, Some("network_error".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_network_monitoring() {
+        let crypto_service = CryptoService::new().unwrap();
+        let mut handler = ProtocolHandler::new(crypto_service);
+        
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Update network status
+        let status_msg = ProtocolMessage::NetworkStatus {
+            available_bandwidth: 1024 * 1024, // 1MB/s
+            latency_ms: 50,
+            packet_loss: 0.01,
+            timestamp,
+            expiry: MESSAGE_EXPIRY_SECONDS,
+            ephemeral_id: handler.generate_ephemeral_id(),
+        };
+        handler.handle_message("peer1".to_string(), serde_json::to_vec(&status_msg).unwrap()).await.unwrap();
+
+        assert_eq!(handler.network_monitor.get_average_bandwidth(), 1024 * 1024);
+        assert_eq!(handler.network_monitor.get_average_latency(), 50);
+        assert_eq!(handler.network_monitor.get_average_packet_loss(), 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_resume() {
+        let crypto_service = CryptoService::new().unwrap();
+        let mut handler = ProtocolHandler::new(crypto_service);
+        
+        let file_id = handler.generate_ephemeral_id();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Request transfer resume
+        let resume_msg = ProtocolMessage::TransferResumeRequest {
+            file_id: file_id.clone(),
+            resume_point: 1024,
+            network_status: NetworkStatus {
+                available_bandwidth: 1024 * 1024,
+                latency_ms: 50,
+                packet_loss: 0.01,
+            },
+            timestamp,
+            expiry: MESSAGE_EXPIRY_SECONDS,
+            ephemeral_id: handler.generate_ephemeral_id(),
+        };
+        handler.handle_message("peer1".to_string(), serde_json::to_vec(&resume_msg).unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_error_recovery() {
+        let crypto_service = CryptoService::new().unwrap();
+        let mut handler = ProtocolHandler::new(crypto_service);
+        
+        let file_id = handler.generate_ephemeral_id();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Request error recovery
+        let error_msg = ProtocolMessage::ErrorRecoveryRequest {
+            file_id: file_id.clone(),
+            error_type: "network_error".to_string(),
+            error_details: "Connection timeout".to_string(),
+            timestamp,
+            expiry: MESSAGE_EXPIRY_SECONDS,
+            ephemeral_id: handler.generate_ephemeral_id(),
+        };
+        handler.handle_message("peer1".to_string(), serde_json::to_vec(&error_msg).unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_transfer_queue_priority() {
+        let crypto_service = CryptoService::new().unwrap();
+        let mut handler = ProtocolHandler::new(crypto_service);
+        
+        let file_id1 = handler.generate_ephemeral_id();
+        let file_id2 = handler.generate_ephemeral_id();
+        
+        // Set different priorities
+        handler.transfer_queue.update_priority(&file_id1, 3);
+        handler.transfer_queue.update_priority(&file_id2, 1);
+        
+        // Add to queue
+        handler.transfer_queue.add_transfer(file_id1.clone());
+        handler.transfer_queue.add_transfer(file_id2.clone());
+        
+        assert_eq!(handler.transfer_queue.get_priority(&file_id1), 3);
+        assert_eq!(handler.transfer_queue.get_priority(&file_id2), 1);
     }
 } 
