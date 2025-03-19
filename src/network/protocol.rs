@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, Semaphore};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::cmp::Ordering;
 use crate::crypto::CryptoService;
+use sha2::Sha256;
 
 const MESSAGE_EXPIRY_SECONDS: u64 = 60;
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
@@ -208,6 +209,13 @@ pub enum ProtocolMessage {
         timestamp: u64,
         expiry: u64,
         ephemeral_id: String,
+    },
+    FileChunk {
+        file_id: String,
+        chunk_index: u32,
+        total_chunks: u32,
+        chunk_data: Vec<u8>,
+        chunk_hash: String,
     },
 }
 
@@ -899,6 +907,32 @@ impl ProtocolHandler {
                 }
 
                 self.execute_recovery_action(file_id, recovery_action, *retry_delay).await?;
+            }
+            ProtocolMessage::FileChunk {
+                file_id,
+                chunk_index,
+                total_chunks,
+                chunk_data,
+                chunk_hash,
+            } => {
+                // Verify chunk hash
+                let computed_hash = Sha256::digest(&chunk_data).to_string();
+                if computed_hash != chunk_hash {
+                    return Err(anyhow::anyhow!("Invalid chunk hash"));
+                }
+
+                // Update transfer info
+                if let Some(transfer) = self.file_transfers.get_mut(&file_id) {
+                    transfer.received_chunks.insert(chunk_index);
+                    transfer.bytes_transferred += chunk_data.len() as u64;
+
+                    // Check if all chunks received
+                    if transfer.received_chunks.len() == total_chunks as usize {
+                        self.handle_file_completion(&file_id).await?;
+                    }
+                }
+
+                Ok(())
             }
         }
 
