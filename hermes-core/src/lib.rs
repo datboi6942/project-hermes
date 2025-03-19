@@ -145,6 +145,26 @@ impl NetworkService {
                 if let Ok(msg) = serde_json::from_slice::<Message>(&data) {
                     #[cfg(feature = "logging")]
                     info!("Decoded protocol message: {:?}", msg.message_type);
+                    
+                    // Display the message to the user
+                    match msg.message_type {
+                        MessageType::Text => {
+                            let content = String::from_utf8_lossy(&msg.content);
+                            println!("\n📩 Received message from {}", msg.sender);
+                            println!("   {}", content);
+                            println!("   (Received at: {})", chrono::Local::now().format("%H:%M:%S"));
+                        },
+                        MessageType::File => {
+                            println!("\n📦 Received file from {}", msg.sender);
+                            println!("   Size: {} bytes", msg.content.len());
+                        },
+                        MessageType::Control(_) => {
+                            println!("\n🔔 Received control message from {}", msg.sender);
+                        }
+                    }
+                } else {
+                    // Could not decode as a protocol message
+                    println!("\n⚠️ Received unrecognized data from {}", peer_id);
                 }
             }
             _ => {} // Handle other cases
