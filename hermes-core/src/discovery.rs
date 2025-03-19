@@ -8,7 +8,7 @@ use super::onion::OnionNode;
 
 const NODE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const MAX_NODES: usize = 100;
-const MIN_NODES: usize = 10;
+const MIN_NODES: usize = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {

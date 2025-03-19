@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use crate::crypto::CryptoService;
 
 const MAX_HOPS: usize = 3;
-const MIN_HOPS: usize = 2;
+const MIN_HOPS: usize = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnionNode {

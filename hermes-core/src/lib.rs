@@ -32,7 +32,7 @@ pub use protocol::{Message as ProtocolMessage, MessageType as ProtocolMessageTyp
 const MAX_CONNECTIONS: usize = 50;
 const CIRCUIT_EXTENSION_TIMEOUT: Duration = Duration::from_secs(30);
 const MESSAGE_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
-const MIN_HOPS: usize = 3;
+const MIN_HOPS: usize = 1;
 const MAX_HOPS: usize = 5;
 
 // Create a non-derived debug implementation
@@ -243,12 +243,29 @@ impl NetworkService {
             libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
                 #[cfg(feature = "logging")]
                 info!("Listening on {}", address);
+                
+                // Re-register as relay with our updated listener info
+                if let Err(e) = self.register_as_relay().await {
+                    #[cfg(feature = "logging")]
+                    error!("Failed to update relay registration: {:?}", e);
+                }
             }
             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                 #[cfg(feature = "logging")]
                 info!("Connection established with peer {}", peer_id);
                 self.active_connections.insert(peer_id, connection_id);
                 self.message_sender.send(NetworkMessage::ConnectionEstablished(peer_id)).await?;
+                
+                // Try to add this peer to discovery if we have connection to it
+                let node = OnionNode {
+                    id: peer_id.to_base58(),
+                    public_key: vec![0; 32], // We don't know the public key yet, dummy value
+                    address: format!("peer:{}", peer_id),
+                };
+                if let Err(e) = self.node_discovery.add_node(node).await {
+                    #[cfg(feature = "logging")]
+                    error!("Failed to add peer to discovery: {:?}", e);
+                }
             }
             libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, connection_id, .. } => {
                 #[cfg(feature = "logging")]
@@ -407,11 +424,22 @@ impl NetworkService {
     }
 
     pub async fn register_as_relay(&mut self) -> Result<()> {
+        // Get the public IP address from the swarm
+        let addresses: Vec<String> = self.swarm.listeners()
+            .map(|addr| addr.to_string())
+            .collect();
+            
+        let address = if !addresses.is_empty() {
+            addresses.join(",")
+        } else {
+            "0.0.0.0:0".to_string()
+        };
+        
         // Create node info for this peer
         let node = OnionNode {
             id: self.peer_id.to_base58(),
             public_key: self.onion_router.get_public_key(),
-            address: "TODO: Get actual address".to_string(),
+            address,
         };
 
         // Add self to node discovery
