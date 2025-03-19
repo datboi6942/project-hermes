@@ -6,10 +6,10 @@ pub mod crypto;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use crate::crypto::CryptoService;
 use crate::protocol::{ProtocolHandler, Message, MessageType};
 
@@ -80,7 +80,7 @@ impl NetworkService {
                         let conn_id = uuid::Uuid::new_v4().to_string();
                         
                         // Create a channel for sending data to this connection
-                        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+                        let (tx, rx) = mpsc::channel::<Vec<u8>>(32);
                         
                         // Notify about new connection
                         if let Err(e) = msg_sender.send(NetworkMessage::ConnectionEstablished(conn_id.clone(), tx.clone())).await {
@@ -163,7 +163,7 @@ impl NetworkService {
         match TcpStream::connect(addr).await {
             Ok(socket) => {
                 // Create a channel for sending data to this connection
-                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+                let (tx, rx) = mpsc::channel::<Vec<u8>>(32);
                 
                 // Store the connection sender
                 self.connections.insert(peer_id.clone(), tx.clone());
@@ -194,6 +194,25 @@ impl NetworkService {
     }
     
     pub async fn send_message(&mut self, peer_id: String, data: Vec<u8>) -> Result<()> {
+        // Check if we already have a connection to this peer
+        if !self.connections.contains_key(&peer_id) {
+            // No connection yet, try to find the peer's address in our discovery cache
+            let addr_str = format!("{}:9000", peer_id.split('-').next().unwrap_or("0"));
+            
+            // Try to parse as a socket address (this is just a fallback)
+            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                // Try to connect
+                if let Err(e) = self.connect_to_peer(peer_id.clone(), addr).await {
+                    return Err(anyhow::anyhow!("Failed to auto-connect to peer: {}", e));
+                }
+                
+                // Wait for connection to establish
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            } else {
+                return Err(anyhow::anyhow!("No connection to peer and couldn't auto-connect"));
+            }
+        }
+        
         // Create protocol message
         let protocol_message = Message {
             id: uuid::Uuid::new_v4().to_string(),
