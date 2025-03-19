@@ -1,0 +1,12 @@
+[package]
+name = "hermes-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hermes-core = { path = "../hermes-core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4.3", features = ["derive"] }
+log = { workspace = true }
+env_logger = { workspace = true } 
