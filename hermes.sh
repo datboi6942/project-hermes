@@ -20,6 +20,7 @@ show_help() {
     echo "  ./hermes.sh connect <ID> <IP> Connect to a peer"
     echo "  ./hermes.sh send <message>    Send message to last connected peer"
     echo "  ./hermes.sh sendto <ID> <msg> Send message to specific peer"
+    echo "  ./hermes.sh direct <ID> <IP> <msg> Connect and send in one step"
     echo "  ./hermes.sh port <PORT>       Change default port (currently ${LISTEN_ADDR#*:})"
     echo "  ./hermes.sh help              Show this help"
     echo ""
@@ -27,6 +28,7 @@ show_help() {
     echo "  ./hermes.sh start"
     echo "  ./hermes.sh connect abc123 192.168.1.100"
     echo "  ./hermes.sh send \"Hello world!\""
+    echo "  ./hermes.sh direct abc123 192.168.1.100 \"Hello directly!\""
     echo ""
 }
 
@@ -87,15 +89,56 @@ case "$1" in
     sendto)
         if [ $# -lt 3 ]; then
             echo "Error: Please provide peer ID and message"
-            echo "Usage: ./hermes.sh sendto <PEER_ID> \"Your message here\""
+            echo "Usage: ./hermes.sh sendto <PEER_ID> \"Your message here\" [IP_ADDRESS]"
             exit 1
         fi
         
         PEER_ID="$2"
         shift 2
-        MESSAGE="$*"
+        
+        # Check if the last argument might be an IP address
+        IP_ARG=""
+        ARGS=("$@")
+        LAST_ARG="${ARGS[${#ARGS[@]}-1]}"
+        
+        # Very basic check for IP-like format
+        if [[ $LAST_ARG =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            IP_ARG="$LAST_ARG"
+            # Remove the IP from the message arguments
+            unset "ARGS[${#ARGS[@]}-1]"
+            MESSAGE="${ARGS[*]}"
+        else
+            MESSAGE="$*"
+        fi
+        
+        # If we have an IP, connect first
+        if [ -n "$IP_ARG" ]; then
+            echo "Connecting to peer $PEER_ID at $IP_ARG:9000..."
+            cargo run --bin hermes-cli -- connect --peer "$PEER_ID" --address "$IP_ARG:9000"
+        fi
         
         echo "Sending message to $PEER_ID..."
+        cargo run --bin hermes-cli -- send --peer "$PEER_ID" --message "$MESSAGE"
+        
+        # Save for later use
+        LAST_PEER="$PEER_ID"
+        save_config
+        ;;
+        
+    direct)
+        if [ $# -lt 4 ]; then
+            echo "Error: Please provide peer ID, IP address, and message"
+            echo "Usage: ./hermes.sh direct <PEER_ID> <IP_ADDRESS> \"Your message here\""
+            exit 1
+        fi
+        
+        PEER_ID="$2"
+        IP_ADDR="$3"
+        shift 3
+        MESSAGE="$*"
+        
+        echo "Connecting to peer $PEER_ID at $IP_ADDR:9000 and sending message..."
+        cargo run --bin hermes-cli -- connect --peer "$PEER_ID" --address "$IP_ADDR:9000"
         cargo run --bin hermes-cli -- send --peer "$PEER_ID" --message "$MESSAGE"
         
         # Save for later use
