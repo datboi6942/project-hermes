@@ -44,6 +44,18 @@ enum Command {
         #[clap(long)]
         message: String,
     },
+    /// Connect to a peer and send a message in one operation
+    Direct {
+        /// Peer ID to connect to and send message
+        #[clap(long)]
+        peer: String,
+        /// Address of the peer (e.g. "192.168.1.5:9000")
+        #[clap(long)]
+        address: String,
+        /// Message to send
+        #[clap(long)]
+        message: String,
+    },
 }
 
 #[tokio::main]
@@ -118,6 +130,31 @@ async fn main() -> Result<()> {
                     println!("Failed to send message: {}", e);
                     println!("Note: The recipient must be online and connected.");
                     println!("Try running 'connect' command first to establish a connection.");
+                    return Err(e);
+                }
+            }
+        },
+        Command::Direct { peer, address, message } => {
+            info!("Connecting to peer {} at {} and sending message", peer, address);
+            
+            // Parse socket address
+            let addr: SocketAddr = address.parse().expect("Failed to parse socket address");
+            
+            // Connect to the peer
+            network.connect_to_peer(peer.clone(), addr).await?;
+            
+            // Convert message string to bytes
+            let message_bytes = message.as_bytes().to_vec();
+            
+            // Send message (with a short delay to ensure connection is established)
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            
+            match network.send_message(peer.clone(), message_bytes).await {
+                Ok(_) => {
+                    println!("Successfully connected and sent message to {}", peer);
+                },
+                Err(e) => {
+                    println!("Connected to peer but failed to send message: {}", e);
                     return Err(e);
                 }
             }

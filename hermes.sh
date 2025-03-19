@@ -138,8 +138,8 @@ case "$1" in
         MESSAGE="$*"
         
         echo "Connecting to peer $PEER_ID at $IP_ADDR:9000 and sending message..."
-        cargo run --bin hermes-cli -- connect --peer "$PEER_ID" --address "$IP_ADDR:9000"
-        cargo run --bin hermes-cli -- send --peer "$PEER_ID" --message "$MESSAGE"
+        # Use a single command to connect and send in one operation
+        cargo run --bin hermes-cli -- direct --peer "$PEER_ID" --address "$IP_ADDR:9000" --message "$MESSAGE"
         
         # Save for later use
         LAST_PEER="$PEER_ID"
